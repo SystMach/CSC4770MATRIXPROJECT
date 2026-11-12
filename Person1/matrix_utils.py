@@ -1,11 +1,28 @@
 """
 matrix_utils.py - Person 1
-Matrix validation, generation, and row-block splitting for the scheduler.
+Matrix validation, zero-padding, and row x column block splitting for the scheduler.
 
 Matrices are plain Python lists of lists so they serialize straight to JSON.
+
+How the work is divided
+-----------------------
+A (m x n) is split into groups of rows, and B (n x p) into groups of columns.
+Each (row group, column group) pair is one job:
+
+    block_a = rows  start_row..end_row  of A   (all n columns)
+    block_b = cols  start_col..end_col  of B   (all n rows)
+
+block_a x block_b is a complete block of the result C = A x B, placed at
+(start_row, start_col). Keeping the full inner length n in every pair means each
+worker produces a finished piece of C with no partial sums to add up later.
+
+So that every job is the same size, A gets extra zero rows and B extra zero
+columns when m or p don't divide evenly. The padded parts of C are all zeros and
+are trimmed back to m x p by the aggregator.
 """
 
 import json
+import math
 import random
 
 
@@ -13,6 +30,9 @@ class MatrixError(ValueError):
     """Raised when a matrix (or pair of matrices) is invalid."""
 
 
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
 def validate_matrix(m, name="matrix"):
     """Check one matrix is non-empty, rectangular, and numeric.
 
@@ -54,55 +74,83 @@ def validate_pair(a, b):
     return rows_a, cols_a, cols_b
 
 
-def split_rows(num_rows, block_size):
-    """Split row indices 0..num_rows-1 into blocks of `block_size`.
+# ---------------------------------------------------------------------------
+# Splitting and padding
+# ---------------------------------------------------------------------------
+def padded_length(n, block):
+    """Smallest multiple of `block` that is >= n.
 
-    Returns a list of (start_row, end_row) with end_row EXCLUSIVE.
-    The last block may be smaller.
-
-    >>> split_rows(25, 10)
-    [(0, 10), (10, 20), (20, 25)]
+    >>> padded_length(25, 10)
+    30
     """
-    if num_rows <= 0:
-        raise MatrixError("num_rows must be positive")
-    if block_size <= 0:
-        raise MatrixError("block_size must be positive")
-    return [
-        (start, min(start + block_size, num_rows))
-        for start in range(0, num_rows, block_size)
-    ]
+    if n <= 0:
+        raise MatrixError("length must be positive")
+    if block <= 0:
+        raise MatrixError("block size must be positive")
+    return math.ceil(n / block) * block
 
 
-def make_jobs(a, block_size):
-    """Turn Matrix A into a list of job metadata dicts (one per row block)."""
+def split_ranges(n, block):
+    """Split 0..n-1 into equal blocks of `block`, padding n up if needed.
+
+    Returns a list of (start, end) with end EXCLUSIVE. Every block has the same
+    size; the last one may extend past n into padding.
+
+    >>> split_ranges(25, 10)
+    [(0, 10), (10, 20), (20, 30)]
+    """
+    total = padded_length(n, block)
+    return [(s, s + block) for s in range(0, total, block)]
+
+
+def pad_rows(m, total_rows):
+    """Return a copy of m with zero rows added at the bottom up to total_rows."""
+    cols = len(m[0])
+    return [list(r) for r in m] + [[0] * cols for _ in range(total_rows - len(m))]
+
+
+def pad_cols(m, total_cols):
+    """Return a copy of m with zero columns added on the right up to total_cols."""
+    extra = total_cols - len(m[0])
+    return [list(r) + [0] * extra for r in m]
+
+
+def column_block(m, start, end):
+    """Columns start..end-1 of m, keeping every row."""
+    return [row[start:end] for row in m]
+
+
+def make_jobs(rows_a, cols_b, block_rows, block_cols):
+    """Create one job per (row group of A, column group of B) pair.
+
+    Jobs are ordered row by row: all column groups of rows 0..k, then the next
+    row group, and so on. Coordinates refer to the padded matrices; because
+    padding is only added at the bottom/right, start_row and start_col are also
+    the correct positions in the real result.
+    """
     jobs = []
-    for job_id, (start, end) in enumerate(split_rows(len(a), block_size), start=1):
-        jobs.append({
-            "job_id": job_id,
-            "start_row": start,
-            "end_row": end,            # exclusive
-            "status": "pending",       # pending -> in_progress -> completed
-            "assigned_worker": None,
-            "assigned_time": None,
-            "completed_time": None,
-            "attempts": 0,
-        })
+    job_id = 1
+    for start_row, end_row in split_ranges(rows_a, block_rows):
+        for start_col, end_col in split_ranges(cols_b, block_cols):
+            jobs.append({
+                "job_id": job_id,
+                "start_row": start_row,
+                "end_row": end_row,        # exclusive
+                "start_col": start_col,
+                "end_col": end_col,        # exclusive
+                "status": "pending",       # pending -> in_progress -> completed
+                "assigned_worker": None,
+                "assigned_time": None,
+                "completed_time": None,
+                "attempts": 0,
+            })
+            job_id += 1
     return jobs
 
 
-def validate_result_rows(result_rows, expected_rows, expected_cols):
-    """Check a worker's result block has the right shape and numeric values."""
-    if not isinstance(result_rows, list) or len(result_rows) != expected_rows:
-        got = len(result_rows) if isinstance(result_rows, list) else type(result_rows).__name__
-        raise MatrixError(f"expected {expected_rows} result rows, got {got}")
-    for i, row in enumerate(result_rows):
-        if not isinstance(row, list) or len(row) != expected_cols:
-            raise MatrixError(f"result row {i} should have {expected_cols} values")
-        for v in row:
-            if isinstance(v, bool) or not isinstance(v, (int, float)):
-                raise MatrixError(f"result row {i} contains non-number {v!r}")
-
-
+# ---------------------------------------------------------------------------
+# Helpers for testing / verification
+# ---------------------------------------------------------------------------
 def random_matrix(rows, cols, low=0, high=9, seed=None):
     """Generate a rows x cols matrix of random integers (for testing/benchmarks)."""
     rng = random.Random(seed)
@@ -122,3 +170,9 @@ def load_matrices(path):
     if "A" not in data or "B" not in data:
         raise MatrixError(f"{path} must contain keys 'A' and 'B'")
     return data["A"], data["B"]
+
+
+def save_matrices(path, a, b):
+    """Write {"A": [[...]], "B": [[...]]} so others can verify the result."""
+    with open(path, "w") as f:
+        json.dump({"A": a, "B": b}, f)

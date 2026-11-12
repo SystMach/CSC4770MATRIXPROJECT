@@ -3,27 +3,36 @@ scheduler.py - Person 1: Scheduler + Matrix Division
  
 Central TCP server that:
   1. Validates Matrix A and Matrix B
-  2. Splits A into row blocks (one job per block)
+  2. Splits A into row groups and B into column groups (zero-padded so every
+     job is the same size) and pairs them: one job per (row group, column group)
   3. Hands jobs to workers on request from a dynamic queue
   4. Tracks job status (pending / in_progress / completed)
-  5. Places result rows into the final matrix by start_row
-  6. Tells workers to stop when every job is done
+  5. Marks jobs completed when workers report job_done
+  6. Tells workers to stop only when every job is done
+ 
+Workers send their result blocks to the aggregator (Person 3), NOT to the
+scheduler. The scheduler never sees the answer - it only coordinates the work.
  
 Protocol: newline-delimited JSON over TCP (one JSON object per line).
  
   Worker -> Scheduler
-    {"type": "register",    "worker_id": "worker-1"}                  (optional)
     {"type": "request_job", "worker_id": "worker-1"}
-    {"type": "result", "worker_id": "worker-1", "job_id": 3,
-     "start_row": 20, "result_rows": [[...]], "compute_time": 0.0012}
+    {"type": "job_done",    "worker_id": "worker-1", "job_id": 3}
  
   Scheduler -> Worker
-    {"type": "registered",  "worker_id": "worker-1"}
-    {"type": "job", "job_id": 3, "start_row": 20, "rows_a": [[...]], "matrix_b": [[...]]}
+    {"type": "job", "job_id": 3, "start_row": 0, "start_col": 20,
+     "block_a": [[...]], "block_b": [[...]]}
     {"type": "ack", "job_id": 3}
     {"type": "wait", "retry_after": 0.2}     queue empty, but jobs still running
-    {"type": "no_more_jobs"}                 everything finished - disconnect
+    {"type": "no_more_jobs"}                 every job finished - disconnect
     {"type": "error", "message": "..."}
+ 
+  Aggregator (or anyone) -> Scheduler
+    {"type": "get_info"}
+  Scheduler -> Aggregator
+    {"type": "info", "out_rows": 25, "out_cols": 25, "padded_rows": 30,
+     "padded_cols": 30, "inner_dim": 25, "block_rows": 10,
+     "block_cols": 10, "num_jobs": 9}
  
 Every option can be set with a command-line flag or an environment variable
 (handy for Docker), e.g.  SCHEDULER_PORT=5000 BLOCK_SIZE=10 python scheduler.py
@@ -33,7 +42,6 @@ import argparse
 import json
 import logging
 import os
-import socket
 import socketserver
 import threading
 import time
@@ -48,28 +56,53 @@ log = logging.getLogger("scheduler")
 # Job bookkeeping (no networking here - easy to unit-test)
 # --------------------------------------------------------------------------
 class JobManager:
-    """Owns the job queue, the status table, and the result matrix.
+    """Owns the job queue and the status table.
  
-    All public methods are thread-safe: every worker connection runs in its
-    own thread, and they all share one lock.
+    All public methods are thread-safe: every connection runs in its own
+    thread, and they all share one lock.
     """
  
-    def __init__(self, a, b, block_size, job_timeout=None):
-        self.rows_a, self.cols_a, self.cols_b = mu.validate_pair(a, b)
-        self.a = a
-        self.b = b
-        self.block_size = block_size
-        self.job_timeout = job_timeout  # seconds before an in-progress job is re-queued
+    def __init__(self, a, b, block_size):
+        self.out_rows, self.inner_dim, self.out_cols = mu.validate_pair(a, b)
+        if block_size <= 0:
+            raise mu.MatrixError("block size must be positive")
  
-        self.jobs = {j["job_id"]: j for j in mu.make_jobs(a, block_size)}
+        # A block bigger than the matrix would only add padding - shrink it.
+        self.block_rows = min(block_size, self.out_rows)
+        self.block_cols = min(block_size, self.out_cols)
+ 
+        # Zero-pad so every job is exactly block_rows x block_cols.
+        self.padded_rows = mu.padded_length(self.out_rows, self.block_rows)
+        self.padded_cols = mu.padded_length(self.out_cols, self.block_cols)
+        self.a_orig, self.b_orig = a, b
+        self.a = mu.pad_rows(a, self.padded_rows)
+        self.b = mu.pad_cols(b, self.padded_cols)
+ 
+        self.jobs = {j["job_id"]: j for j in mu.make_jobs(
+            self.out_rows, self.out_cols, self.block_rows, self.block_cols)}
         self.queue = deque(self.jobs.keys())
-        self.result = [None] * self.rows_a
-        self.workers = {}  # worker_id -> stats
+        self._col_cache = {}   # start_col -> column block of B (reused across jobs)
+        self.workers = {}      # worker_id -> stats
  
         self.lock = threading.Lock()
         self.done = threading.Event()
         self.start_time = None   # first job handed out
-        self.end_time = None     # last result received
+        self.end_time = None     # last job_done received
+ 
+    # ---- info for the aggregator ------------------------------------
+    def info(self):
+        """Sizes Person 3 needs to assemble and trim the final matrix."""
+        return {
+            "type": "info",
+            "out_rows": self.out_rows,        # real result size (trim to this)
+            "out_cols": self.out_cols,
+            "padded_rows": self.padded_rows,  # size including zero padding
+            "padded_cols": self.padded_cols,
+            "inner_dim": self.inner_dim,
+            "block_rows": self.block_rows,    # usually both equal BLOCK_SIZE
+            "block_cols": self.block_cols,
+            "num_jobs": len(self.jobs),
+        }
  
     # ---- workers -----------------------------------------------------
     def register(self, worker_id):
@@ -77,7 +110,6 @@ class JobManager:
             if worker_id not in self.workers:
                 self.workers[worker_id] = {
                     "jobs_completed": 0,
-                    "rows_completed": 0,
                     "compute_time": 0.0,
                     "registered_time": time.time(),
                 }
@@ -90,11 +122,9 @@ class JobManager:
             if self.done.is_set():
                 return {"type": "no_more_jobs"}
  
-            self._requeue_timed_out()
- 
             while self.queue:
                 job = self.jobs[self.queue.popleft()]
-                if job["status"] == "completed":   # stale entry from a requeue
+                if job["status"] != "pending":   # stale entry from a requeue
                     continue
                 now = time.time()
                 job["status"] = "in_progress"
@@ -103,57 +133,58 @@ class JobManager:
                 job["attempts"] += 1
                 if self.start_time is None:
                     self.start_time = now
-                s, e = job["start_row"], job["end_row"]
-                log.info("job %d (rows %d-%d) -> %s", job["job_id"], s, e - 1, worker_id)
-                return {
-                    "type": "job",
-                    "job_id": job["job_id"],
-                    "start_row": s,
-                    "rows_a": self.a[s:e],
-                    "matrix_b": self.b,
-                }
+                log.info("job %d (rows %d-%d, cols %d-%d) -> %s", job["job_id"],
+                         job["start_row"], job["end_row"] - 1,
+                         job["start_col"], job["end_col"] - 1, worker_id)
+                return self._job_message(job)
  
             # Queue empty, but some jobs are still in progress elsewhere.
             # Keep the worker around in case one of those jobs fails.
             return {"type": "wait", "retry_after": 0.2}
  
-    # ---- receiving results ------------------------------------------
-    def submit_result(self, worker_id, job_id, start_row, result_rows, compute_time=0.0):
-        """Store a worker's result block. Returns (ok, message)."""
+    def _job_message(self, job):
+        # caller holds the lock
+        sr, er = job["start_row"], job["end_row"]
+        sc, ec = job["start_col"], job["end_col"]
+        if sc not in self._col_cache:
+            self._col_cache[sc] = mu.column_block(self.b, sc, ec)
+        return {
+            "type": "job",
+            "job_id": job["job_id"],
+            "start_row": sr,
+            "start_col": sc,
+            "block_a": self.a[sr:er],          # block_rows x inner_dim
+            "block_b": self._col_cache[sc],    # inner_dim x block_cols
+        }
+ 
+    # ---- completion --------------------------------------------------
+    def job_done(self, worker_id, job_id, compute_time=None):
+        """Mark a job completed. Returns (ok, message)."""
         with self.lock:
             job = self.jobs.get(job_id)
             if job is None:
-                return False, f"unknown job_id {job_id}"
-            if start_row != job["start_row"]:
-                return False, f"job {job_id} starts at row {job['start_row']}, not {start_row}"
+                return False, f"unknown job_id {job_id!r}"
             if job["status"] == "completed":
-                # Duplicate (e.g. a slow worker finishing a re-queued job) - ignore it.
-                return True, "duplicate result ignored"
+                # e.g. a worker that reconnected and reported the same job twice.
+                return True, "already completed"
+            if job["status"] == "pending" and job["attempts"] == 0:
+                return False, f"job {job_id} was never handed out"
  
-            n = job["end_row"] - job["start_row"]
-            try:
-                mu.validate_result_rows(result_rows, n, self.cols_b)
-            except mu.MatrixError as exc:
-                self._requeue(job)
-                return False, f"bad result for job {job_id}: {exc} (job re-queued)"
- 
-            self.result[start_row:start_row + n] = result_rows
             now = time.time()
             job["status"] = "completed"
             job["completed_time"] = now
             job["assigned_worker"] = worker_id
  
             w = self.workers.setdefault(worker_id, {
-                "jobs_completed": 0, "rows_completed": 0,
-                "compute_time": 0.0, "registered_time": now})
+                "jobs_completed": 0, "compute_time": 0.0, "registered_time": now})
             w["jobs_completed"] += 1
-            w["rows_completed"] += n
-            w["compute_time"] += float(compute_time or 0.0)
+            if isinstance(compute_time, (int, float)) and not isinstance(compute_time, bool):
+                w["compute_time"] += compute_time
  
-            log.info("job %d completed by %s (%d/%d done)",
-                     job_id, worker_id, self.completed_count(), len(self.jobs))
+            done = sum(1 for j in self.jobs.values() if j["status"] == "completed")
+            log.info("job %d done by %s (%d/%d)", job_id, worker_id, done, len(self.jobs))
  
-            if all(j["status"] == "completed" for j in self.jobs.values()):
+            if done == len(self.jobs):
                 self.end_time = now
                 self.done.set()
                 log.info("all %d jobs completed", len(self.jobs))
@@ -175,22 +206,7 @@ class JobManager:
         job["assigned_time"] = None
         self.queue.appendleft(job["job_id"])
  
-    def _requeue_timed_out(self):
-        # caller holds the lock
-        if not self.job_timeout:
-            return
-        now = time.time()
-        for job in self.jobs.values():
-            if (job["status"] == "in_progress"
-                    and now - job["assigned_time"] > self.job_timeout):
-                log.warning("job %d timed out on %s; re-queuing",
-                            job["job_id"], job["assigned_worker"])
-                self._requeue(job)
- 
     # ---- reporting ---------------------------------------------------
-    def completed_count(self):
-        return sum(1 for j in self.jobs.values() if j["status"] == "completed")
- 
     def status_counts(self):
         with self.lock:
             counts = {"pending": 0, "in_progress": 0, "completed": 0}
@@ -201,16 +217,15 @@ class JobManager:
     def summary(self):
         with self.lock:
             total = (self.end_time - self.start_time) if self.end_time and self.start_time else None
-            return {
-                "matrix_a_shape": [self.rows_a, self.cols_a],
-                "matrix_b_shape": [self.cols_a, self.cols_b],
-                "block_size": self.block_size,
-                "num_jobs": len(self.jobs),
+            s = self.info()
+            del s["type"]
+            s.update({
                 "num_workers": len(self.workers),
                 "total_time_sec": total,
                 "workers": self.workers,
                 "jobs": list(self.jobs.values()),
-            }
+            })
+            return s
  
  
 # --------------------------------------------------------------------------
@@ -221,14 +236,14 @@ def send_msg(wfile, msg):
     wfile.flush()
  
  
-class WorkerHandler(socketserver.StreamRequestHandler):
-    """One instance (and one thread) per connected worker."""
+class ConnectionHandler(socketserver.StreamRequestHandler):
+    """One instance (and one thread) per connection (worker or aggregator)."""
  
     def handle(self):
         mgr: JobManager = self.server.manager
         worker_id = None
         peer = "%s:%s" % self.client_address
-        log.info("connection from %s", peer)
+        log.debug("connection from %s", peer)
         try:
             for raw in self.rfile:  # one JSON message per line
                 line = raw.strip()
@@ -239,6 +254,9 @@ class WorkerHandler(socketserver.StreamRequestHandler):
                 except json.JSONDecodeError:
                     send_msg(self.wfile, {"type": "error", "message": "invalid JSON"})
                     continue
+                if not isinstance(msg, dict):
+                    send_msg(self.wfile, {"type": "error", "message": "message must be a JSON object"})
+                    continue
  
                 mtype = msg.get("type")
                 wid = msg.get("worker_id")
@@ -246,8 +264,8 @@ class WorkerHandler(socketserver.StreamRequestHandler):
                     worker_id = str(wid)
                     mgr.register(worker_id)
  
-                if mtype == "register":
-                    send_msg(self.wfile, {"type": "registered", "worker_id": worker_id})
+                if mtype == "get_info":
+                    send_msg(self.wfile, mgr.info())
  
                 elif mtype == "request_job":
                     if worker_id is None:
@@ -258,14 +276,9 @@ class WorkerHandler(socketserver.StreamRequestHandler):
                     if reply["type"] == "no_more_jobs":
                         break
  
-                elif mtype == "result":
-                    ok, info = mgr.submit_result(
-                        worker_id or "unknown",
-                        msg.get("job_id"),
-                        msg.get("start_row"),
-                        msg.get("result_rows"),
-                        msg.get("compute_time", 0.0),
-                    )
+                elif mtype == "job_done":
+                    ok, info = mgr.job_done(worker_id or "unknown", msg.get("job_id"),
+                                            msg.get("compute_time"))
                     if ok:
                         send_msg(self.wfile, {"type": "ack", "job_id": msg.get("job_id")})
                     else:
@@ -279,7 +292,7 @@ class WorkerHandler(socketserver.StreamRequestHandler):
         finally:
             if worker_id:
                 mgr.worker_lost(worker_id)
-            log.info("connection closed: %s (%s)", worker_id or "?", peer)
+                log.info("connection closed: %s", worker_id)
  
  
 class SchedulerServer(socketserver.ThreadingTCPServer):
@@ -287,17 +300,20 @@ class SchedulerServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
  
     def __init__(self, addr, manager):
-        super().__init__(addr, WorkerHandler)
+        super().__init__(addr, ConnectionHandler)
         self.manager = manager
  
  
-def run(manager, host="0.0.0.0", port=5000, grace=2.0, output=None, verify=False):
-    """Serve until every job is complete, then return the result matrix."""
+def run(manager, host="0.0.0.0", port=5000, grace=2.0, output=None):
+    """Serve until every job is complete, then return the run summary."""
     server = SchedulerServer((host, port), manager)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
-    log.info("listening on %s:%d - %d jobs of up to %d rows",
-             host, server.server_address[1], len(manager.jobs), manager.block_size)
+    i = manager.info()
+    log.info("listening on %s:%d", host, server.server_address[1])
+    log.info("result %dx%d (padded to %dx%d), %d jobs of %dx%d",
+             i["out_rows"], i["out_cols"], i["padded_rows"], i["padded_cols"],
+             i["num_jobs"], manager.block_rows, manager.block_cols)
  
     try:
         while not manager.done.wait(timeout=5):
@@ -314,19 +330,11 @@ def run(manager, host="0.0.0.0", port=5000, grace=2.0, output=None, verify=False
     if summary["total_time_sec"] is not None:
         log.info("finished in %.4f s using %d workers",
                  summary["total_time_sec"], summary["num_workers"])
- 
-    if verify and manager.done.is_set():
-        correct = manager.result == mu.multiply(manager.a, manager.b)
-        summary["verified"] = correct
-        log.info("verification against single-process multiply: %s",
-                 "PASS" if correct else "FAIL")
- 
     if output:
         with open(output, "w") as f:
-            json.dump({"summary": summary, "result": manager.result}, f)
+            json.dump(summary, f, indent=2)
         log.info("wrote %s", output)
- 
-    return manager.result, summary
+    return summary
  
  
 # --------------------------------------------------------------------------
@@ -341,18 +349,16 @@ def parse_args(argv=None):
     p.add_argument("--host", default=env("SCHEDULER_HOST", "0.0.0.0"))
     p.add_argument("--port", type=int, default=int(env("SCHEDULER_PORT", 5000)))
     p.add_argument("--size", type=int, default=int(env("MATRIX_SIZE", 100)),
-                   help="square size N for random NxN A and B (ignored with --input)")
+                   help="size N for random NxN A and B (ignored with --input)")
     p.add_argument("--block-size", type=int, default=int(env("BLOCK_SIZE", 10)),
-                   help="rows of A per job")
+                   help="rows of A and columns of B per job")
     p.add_argument("--input", default=env("MATRIX_FILE", None),
                    help='JSON file with {"A": [[...]], "B": [[...]]}')
+    p.add_argument("--save-matrices", default=env("SAVE_MATRICES", None),
+                   help="write the A and B used to this JSON file (for verification)")
     p.add_argument("--seed", type=int, default=int(env("SEED", 42)))
-    p.add_argument("--output", default=env("OUTPUT_FILE", "result.json"))
-    p.add_argument("--job-timeout", type=float, default=float(env("JOB_TIMEOUT", 60)),
-                   help="seconds before an unfinished job is re-queued (0 = never)")
+    p.add_argument("--output", default=env("OUTPUT_FILE", "run_summary.json"))
     p.add_argument("--grace", type=float, default=float(env("GRACE_PERIOD", 2)))
-    p.add_argument("--verify", action="store_true",
-                   default=env("VERIFY", "0").lower() in ("1", "true", "yes"))
     return p.parse_args(argv)
  
  
@@ -369,12 +375,16 @@ def main(argv=None):
         b = mu.random_matrix(args.size, args.size, seed=args.seed + 1)
  
     try:
-        manager = JobManager(a, b, args.block_size, job_timeout=args.job_timeout or None)
+        manager = JobManager(a, b, args.block_size)
     except mu.MatrixError as exc:
         log.error("invalid input: %s", exc)
         raise SystemExit(1)
  
-    run(manager, args.host, args.port, args.grace, args.output, args.verify)
+    if args.save_matrices:
+        mu.save_matrices(args.save_matrices, a, b)
+        log.info("saved A and B to %s", args.save_matrices)
+ 
+    run(manager, args.host, args.port, args.grace, args.output)
  
  
 if __name__ == "__main__":
