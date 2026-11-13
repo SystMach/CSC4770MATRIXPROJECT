@@ -1,0 +1,66 @@
+Notes for connecting my worker
+
+Keep worker.py and matrix_multiplication.py in the same folder. It uses
+loops, so there is nothing extra to install.
+
+Person 1
+
+My worker sends the answers to Person 3, so the scheduler needs these changes:
+
+- Send block_a and block_b instead of rows_a and matrix_b. Add start_col.
+- Split A by rows and B by columns, then pair the groups. Keep the full
+  matching row/column length in each pair so the worker gets a complete answer.
+- Keep the jobs equal-sized. If you pad with zeros, tell Person 3 the original
+  output size so they can remove the extra rows or columns.
+- Keep request_job, wait with retry_after, and no_more_jobs. Only send
+  no_more_jobs when every job is finished.
+- Accept job_done with worker_id and job_id, then reply with ack and job_id.
+  Person 3 puts the final matrix together instead of the scheduler.
+- Put unfinished jobs back in the queue if a worker disconnects.
+
+Example job to send me:
+{"type":"job","job_id":1,"start_row":0,"start_col":0,"block_a":[[1,2]],"block_b":[[3],[4]]}
+
+Person 3
+
+This is what my worker sends you for that example:
+{"type":"result","worker_id":"worker-1","job_id":1,"start_row":0,"start_col":0,"result_rows":[[11]],"compute_time":0.001}
+
+Please match those names exactly. job_id is an integer. start_row and
+start_col start at 0. result_rows is the answer block, and compute_time
+is in seconds. The time above is just an example.
+
+Put the block at its row/column position, then reply:
+{"type":"ack","job_id":1}
+
+Use the same job_id you received. My worker waits for your ack before
+sending job_done to Person 1. If a job gets sent again, acknowledge it
+without counting it twice.
+
+Get the output size and expected job IDs, positions and shapes from
+Person 1 over TCP before starting. Check incoming results against them.
+Keep the aggregator running until the workers are finished.
+
+Connection settings
+
+Both servers use TCP and JSON. End each message with a newline (\n), flush
+it, and send one reply per request. Keep connections open for more jobs
+and allow multiple workers. For an error, send:
+{"type":"error","message":"What went wrong"}
+
+For Docker, these are the environment variable names my worker reads:
+SCHEDULER_HOST, SCHEDULER_PORT, AGGREGATOR_HOST, AGGREGATOR_PORT, WORKER_ID
+
+The default ports are 5000 and 5001. Set the hosts to your actual service
+names inside Docker, not 127.0.0.1. Leave WORKER_ID unset to get a unique
+name for each worker.
+
+Sources I used for inspiration
+
+Matrix multiplication with nested loops:
+https://www.geeksforgeeks.org/python/python-program-multiply-two-matrices/
+
+Separating the worker's validation, calculation and result preparation:
+https://github.com/gum-kelvin/distributed_matrix/blob/master/worker.py
+
+We still need to test all three parts together.

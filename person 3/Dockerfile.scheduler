@@ -1,0 +1,5 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY team/Person1/ /app/
+ENV PYTHONUNBUFFERED=1
+CMD ["python", "scheduler.py"]

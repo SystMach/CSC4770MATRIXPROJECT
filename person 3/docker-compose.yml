@@ -1,0 +1,35 @@
+services:
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.scheduler
+    environment:
+      SCHEDULER_HOST: 0.0.0.0
+      MATRIX_SIZE: ${MATRIX_SIZE:-25}
+      BLOCK_SIZE: ${BLOCK_SIZE:-10}
+      SAVE_MATRICES: /data/matrices.json
+      OUTPUT_FILE: /data/run_summary.json
+      GRACE_PERIOD: 3
+    volumes:
+      - ./results:/data
+  aggregator:
+    build:
+      context: .
+      dockerfile: Dockerfile.aggregator
+    command: ["python", "aggregator.py", "--matrices", "/data/matrices.json", "--output", "/data/result.json"]
+    depends_on:
+      - scheduler
+    volumes:
+      - ./results:/data
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      SCHEDULER_HOST: scheduler
+      SCHEDULER_PORT: 5000
+      AGGREGATOR_HOST: aggregator
+      AGGREGATOR_PORT: 5001
+    depends_on:
+      - scheduler
+      - aggregator
